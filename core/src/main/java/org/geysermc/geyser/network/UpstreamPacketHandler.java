@@ -52,6 +52,7 @@ import org.cloudburstmc.protocol.bedrock.packet.ResourcePacksInfoPacket;
 import org.cloudburstmc.protocol.bedrock.packet.SetTitlePacket;
 import org.cloudburstmc.protocol.common.PacketSignal;
 import org.cloudburstmc.protocol.common.util.Zlib;
+import org.cloudburstmc.protocol.BedrockServerSession
 import org.geysermc.geyser.Constants;
 import org.geysermc.geyser.GeyserImpl;
 import org.geysermc.geyser.api.event.bedrock.SessionInitializeEvent;
@@ -95,6 +96,9 @@ public class UpstreamPacketHandler extends LoggingPacketHandler {
     }
 
     private PacketSignal translateAndDefault(BedrockPacket packet) {
+        int clientId = packet.getClientId();
+        GeyserSession session = sessions.get(clientId);
+
         Registries.BEDROCK_PACKET_TRANSLATORS.translate(packet.getClass(), packet, session);
         return PacketSignal.HANDLED; // PacketSignal.UNHANDLED will log a WARN publicly
     }
@@ -169,6 +173,9 @@ public class UpstreamPacketHandler extends LoggingPacketHandler {
 
     @Override
     public PacketSignal handle(LoginPacket loginPacket) {
+        int clientId = loginPacket.getClientId();
+        GeyserSession session = sessions.get(clientId);
+
         if (geyser.isShuttingDown() || geyser.isReloading()) {
             // Don't allow new players in if we're no longer operating
             session.disconnect(GeyserLocale.getLocaleStringLog("geyser.core.shutdown.kick.message"));
@@ -183,6 +190,9 @@ public class UpstreamPacketHandler extends LoggingPacketHandler {
         // Set the block translation based off of version
         session.setBlockMappings(BlockRegistries.BLOCKS.forVersion(loginPacket.getProtocolVersion()));
         session.setItemMappings(Registries.ITEMS.forVersion(loginPacket.getProtocolVersion()));
+
+        LoginEncryptionUtils.handleCertChainData(connector, session, loginPacket);
+        LoginEncryptionUtils.handleClientData(connector, session, loginPacket);
 
         LoginEncryptionUtils.encryptPlayerConnection(session, loginPacket);
 
@@ -217,14 +227,53 @@ public class UpstreamPacketHandler extends LoggingPacketHandler {
         GeyserLocale.loadGeyserLocale(session.locale());
         return PacketSignal.HANDLED;
     }
+    
+    /**
+     * Subclients login is slightly different
+     * GeyserSession is created at this point
+     * Some things have been done for the main client and don't need to be repeated:
+     * * Version compatibility
+     * * Encryption
+     * * Resource packs
+     * Instead we can immediately connect the session
+     */ 
+    @Override
+    public boolean handle(SubClientLoginPacket loginPacket) {
+        int clientId = loginPacket.getClientId();
+
+        // TODO not very clean reaching through Upstream...
+        BedrockServerSession bedrockServerSession = this.sessions.get(0).getUpstream().getSession();
+        GeyserSession session = new GeyserSession(connector, bedrockServerSession, clientId);
+        this.sessions.add(clientId, session);
+
+        LoginEncryptionUtils.handleCertChainData(connector, session, loginPacket);
+        LoginEncryptionUtils.handleClientData(connector, session, loginPacket);
+
+        PlayStatusPacket playStatus = new PlayStatusPacket();
+        playStatus.setSenderId(clientId);
+        playStatus.setStatus(PlayStatusPacket.Status.LOGIN_SUCCESS);
+
+        session.sendUpstreamPacket(playStatus);
+
+        session.connect(connector.getRemoteServer());
+
+        return true;
+    }
+
 
     @Override
     public PacketSignal handle(ResourcePackClientResponsePacket packet) {
+        int clientId = packet.getClientId();
+        GeyserSession session = sessions.get(clientId);
+
+        int clientId = packet.getClientId();
+        GeyserSession session = sessions.get(clientId);
+
         switch (packet.getStatus()) {
             case COMPLETED:
                 if (geyser.getConfig().getRemote().authType() != AuthType.ONLINE) {
                     session.authenticate(session.getAuthData().name());
-                } else if (!couldLoginUserByName(session.getAuthData().name())) {
+                } else if (!couldLoginUserByName(session)) {
                     // We must spawn the white world
                     session.connect();
                 }
@@ -268,11 +317,15 @@ public class UpstreamPacketHandler extends LoggingPacketHandler {
 
     @Override
     public PacketSignal handle(ModalFormResponsePacket packet) {
-        session.executeInEventLoop(() -> session.getFormCache().handleResponse(packet));
+        int clientId = packet.getClientId();
+        GeyserSession session = sessions.get(clientId);
+
         return PacketSignal.HANDLED;
     }
 
-    private boolean couldLoginUserByName(String bedrockUsername) {
+    private boolean couldLoginUserByName(GeyserSession session) {
+        String bedrockUsername = session.getAuthData().getName();
+
         if (geyser.getConfig().getSavedUserLogins().contains(bedrockUsername)) {
             String authChain = geyser.authChainFor(bedrockUsername);
             if (authChain != null) {
@@ -291,6 +344,9 @@ public class UpstreamPacketHandler extends LoggingPacketHandler {
 
     @Override
     public PacketSignal handle(MovePlayerPacket packet) {
+        int clientId = packet.getClientId();
+        GeyserSession session = sessions.get(clientId);
+
         if (session.isLoggingIn()) {
             SetTitlePacket titlePacket = new SetTitlePacket();
             titlePacket.setType(SetTitlePacket.Type.ACTIONBAR);
@@ -358,5 +414,20 @@ public class UpstreamPacketHandler extends LoggingPacketHandler {
         data.setType(ResourcePackType.RESOURCES);
 
         session.sendUpstreamPacket(data);
+    }
+        @Override
+    public boolean handle(DisconnectPacket packet) {
+        int clientId = packet.getClientId();
+
+        // Don't do anything for main client, that's handled by Session DisconnectHandler
+        if (clientId == 0) return false;
+
+        GeyserSession session = sessions.get(clientId);
+
+        session.disconnect(packet.getKickMessage());
+
+        this.sessions.remove(clientId);
+
+        return true;
     }
 }
